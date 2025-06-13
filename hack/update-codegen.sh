@@ -16,4 +16,5 @@ go run k8s.io/kube-openapi/cmd/openapi-gen@v0.0.0-20250610211856-8b98d1ed966a \
     --go-header-file hack/boilerplate.go.txt \
     "${ROOT_DIR}/vendor/k8s.io/api/coordination/v1" \
     "${ROOT_DIR}/vendor/k8s.io/apimachinery/pkg/apis/meta/v1" \
-    "${ROOT_DIR}/vendor/k8s.io/apimachinery/pkg/version"
+    "${ROOT_DIR}/vendor/k8s.io/apimachinery/pkg/version" \
+    "${ROOT_DIR}/vendor/k8s.io/apimachinery/pkg/runtime"

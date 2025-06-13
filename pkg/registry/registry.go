@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	durationutil "k8s.io/apimachinery/pkg/util/duration"
+	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
@@ -43,22 +44,20 @@ type objcetKey struct {
 
 type leaseStorage struct {
 	sync.RWMutex
-	store map[objcetKey]*coordinationv1.Lease
+	store   map[objcetKey]*coordinationv1.Lease
+	watches map[*watch.FakeWatcher]struct{}
 }
 
 func NewMemoryStore() rest.Storage {
 	return &leaseStorage{
-		store: map[objcetKey]*coordinationv1.Lease{},
+		store:   map[objcetKey]*coordinationv1.Lease{},
+		watches: map[*watch.FakeWatcher]struct{}{},
 	}
 }
 
 var _ interface {
 	rest.SingularNameProvider
-	rest.Getter
-	rest.Lister
-	rest.CreaterUpdater
-	rest.GracefulDeleter
-	rest.CollectionDeleter
+	rest.StandardStorage
 } = (*leaseStorage)(nil)
 
 func (*leaseStorage) GetSingularName() string {
@@ -114,6 +113,8 @@ func (l *leaseStorage) Create(ctx context.Context, obj runtime.Object, createVal
 	l.Lock()
 	l.store[key] = obj.(*coordinationv1.Lease)
 	l.Unlock()
+
+	l.notifyWatchers(watch.Added, obj)
 	return obj, nil
 }
 
@@ -152,6 +153,8 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 	l.Lock()
 	l.store[key] = updated.(*coordinationv1.Lease)
 	l.Unlock()
+
+	l.notifyWatchers(watch.Modified, updated)
 	return updated, false, nil
 }
 
@@ -175,14 +178,13 @@ func (l *leaseStorage) Delete(ctx context.Context, name string, deleteValidation
 	l.Lock()
 	delete(l.store, key)
 	l.Unlock()
+
+	l.notifyWatchers(watch.Deleted, obj)
 	return obj, true, nil
 }
 
 func (l *leaseStorage) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
-	items, err := l.list(ctx, listOptions)
-	if err != nil {
-		return nil, err
-	}
+	items := l.list(ctx, listOptions)
 
 	if deleteValidation != nil {
 		if err := deleteValidation(ctx, items); err != nil {
@@ -212,15 +214,48 @@ func (l *leaseStorage) Get(ctx context.Context, name string, options *metav1.Get
 	return obj, nil
 }
 
+func (l *leaseStorage) notifyWatchers(eventType watch.EventType, obj runtime.Object) {
+	var deleted []*watch.FakeWatcher
+	l.RLock()
+	for watcher := range l.watches {
+		if watcher.IsStopped() {
+			deleted = append(deleted, watcher)
+		} else {
+			watcher.Action(eventType, obj)
+		}
+	}
+	l.RUnlock()
+
+	l.Lock()
+	for _, key := range deleted {
+		delete(l.watches, key)
+	}
+	l.Unlock()
+}
+
+func (l *leaseStorage) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	ch := watch.NewFake()
+
+	go func() {
+		l.Lock()
+		l.watches[ch] = struct{}{}
+		l.Unlock()
+
+		items := l.list(ctx, options)
+		for _, item := range items.Items {
+			ch.Add(&item)
+		}
+	}()
+
+	return ch, nil
+}
+
 func (*leaseStorage) NewList() runtime.Object {
 	return &coordinationv1.LeaseList{}
 }
 
 func (l *leaseStorage) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
-	items, err := l.list(ctx, options)
-	if err != nil {
-		return nil, err
-	}
+	items := l.list(ctx, options)
 
 	sort.Slice(items.Items, func(i, j int) bool {
 		if items.Items[i].Namespace != items.Items[j].Namespace {
@@ -231,7 +266,7 @@ func (l *leaseStorage) List(ctx context.Context, options *metainternalversion.Li
 	return items, nil
 }
 
-func (l *leaseStorage) list(ctx context.Context, options *metainternalversion.ListOptions) (*coordinationv1.LeaseList, error) {
+func (l *leaseStorage) list(ctx context.Context, options *metainternalversion.ListOptions) *coordinationv1.LeaseList {
 	namespace := genericapirequest.NamespaceValue(ctx)
 
 	l.RLock()
@@ -248,7 +283,7 @@ func (l *leaseStorage) list(ctx context.Context, options *metainternalversion.Li
 		items.Items = append(items.Items, *obj)
 	}
 
-	return &items, nil
+	return &items
 }
 
 func (*leaseStorage) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
