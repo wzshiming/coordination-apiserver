@@ -94,7 +94,7 @@ func NewServerCommand(ctx context.Context) *cobra.Command {
 			if err := opts.Complete(); err != nil {
 				return err
 			}
-			return runCommand(ctx, opts)
+			return RunCommand(ctx, opts)
 		},
 	}
 
@@ -111,7 +111,7 @@ func NewServerCommand(ctx context.Context) *cobra.Command {
 	return cmd
 }
 
-func runCommand(ctx context.Context, opts *Options) error {
+func RunCommand(ctx context.Context, opts *Options) error {
 	serverCfg, err := opts.ServerConfig()
 	if err != nil {
 		return err
