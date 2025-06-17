@@ -10,6 +10,8 @@ spec:
     targetPort: 443
   selector:
     app: coordination-apiserver
+  # This is required to prevent control plane failures during updates when leases become temporarily unavailable
+  publishNotReadyAddresses: true
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -28,8 +30,23 @@ spec:
       labels:
         app: coordination-apiserver
     spec:
+      terminationGracePeriodSeconds: 40
+      preemptionPolicy: PreemptLowerPriority
+      priority: 2000000000
+      priorityClassName: system-cluster-critical
+      restartPolicy: Always
+      automountServiceAccountToken: false
+      tolerations:
+      - key: node-role.kubernetes.io/control-plane
+        operator: Exists
+        effect: NoSchedule
+      - key: node-role.kubernetes.io/master
+        operator: Exists
+        effect: NoSchedule
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: ""
       containers:
-      - image: ghcr.io/wzshiming/coordination-apiserver:v0.0.1
+      - image: ghcr.io/wzshiming/coordination-apiserver:v0.0.3
         name: coordination-apiserver
         imagePullPolicy: IfNotPresent
         ports:
@@ -61,5 +78,6 @@ spec:
             path: /readyz
             port: 443
             scheme: HTTPS
-          initialDelaySeconds: 10
+          initialDelaySeconds: 1
+          periodSeconds: 2
           timeoutSeconds: 5

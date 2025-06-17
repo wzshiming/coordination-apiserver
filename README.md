@@ -41,7 +41,7 @@ The solution works by deploying our coordination-apiserver and updating the APIS
 
 3. **Wait for the deployment to become ready**:
    ```bash
-   kubectl wait --for=condition=available deployment/coordination-apiserver -n kube-system --timeout=300s
+   kubectl wait --for=condition=ready pod -l app=coordination-apiserver -n kube-system --timeout=300s
    ```
 
 4. **Redirect Lease API to coordination-apiserver**:
