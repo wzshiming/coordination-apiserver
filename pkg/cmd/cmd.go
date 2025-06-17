@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
@@ -80,6 +81,10 @@ func (o *Options) apiserverConfig() (*server.RecommendedConfig, error) {
 	serverConfig.OpenAPIV3Config.Info.Version = "0.0.1"
 
 	serverConfig.EffectiveVersion = utilcompatibility.DefaultBuildEffectiveVersion()
+
+	serverConfig.ShutdownDelayDuration = 30 * time.Second
+	serverConfig.ShutdownWatchTerminationGracePeriod = 30 * time.Second
+	serverConfig.ShutdownSendRetryAfter = true
 	return serverConfig, nil
 }
 
