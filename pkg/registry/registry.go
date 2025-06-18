@@ -106,7 +106,7 @@ func (l *leaseStorage) Create(ctx context.Context, obj runtime.Object, createVal
 
 	if createValidation != nil {
 		if err := createValidation(ctx, obj); err != nil {
-			return nil, errors.NewBadRequest(err.Error())
+			return nil, err
 		}
 	}
 
@@ -126,27 +126,37 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 	obj, ok := l.store[key]
 	l.RUnlock()
 	if !ok {
-		obj := l.New()
-		obj, err := objInfo.UpdatedObject(ctx, obj)
-		if err != nil {
-			return nil, false, errors.NewInternalError(err)
+		if !forceAllowCreate {
+			return nil, false, errors.NewNotFound(coordinationv1.Resource("leases"), fmt.Sprintf("%s/%s", namespace, name))
 		}
 
-		obj, err = l.Create(ctx, obj, createValidation, nil)
+		updated, err := objInfo.UpdatedObject(ctx, obj)
 		if err != nil {
 			return nil, false, err
 		}
-		return obj, true, nil
+
+		if createValidation != nil {
+			if err := createValidation(ctx, updated); err != nil {
+				return nil, false, err
+			}
+		}
+
+		l.Lock()
+		l.store[key] = updated.(*coordinationv1.Lease)
+		l.Unlock()
+
+		l.notifyWatchers(watch.Added, updated)
+		return updated, true, nil
 	}
 
 	updated, err := objInfo.UpdatedObject(ctx, obj)
 	if err != nil {
-		return nil, false, errors.NewInternalError(err)
+		return nil, false, err
 	}
 
 	if updateValidation != nil {
 		if err = updateValidation(ctx, updated, obj); err != nil {
-			return nil, false, errors.NewBadRequest(err.Error())
+			return nil, false, err
 		}
 	}
 
@@ -171,7 +181,7 @@ func (l *leaseStorage) Delete(ctx context.Context, name string, deleteValidation
 
 	if deleteValidation != nil {
 		if err := deleteValidation(ctx, obj); err != nil {
-			return nil, false, errors.NewBadRequest(err.Error())
+			return nil, false, err
 		}
 	}
 
@@ -188,7 +198,7 @@ func (l *leaseStorage) DeleteCollection(ctx context.Context, deleteValidation re
 
 	if deleteValidation != nil {
 		if err := deleteValidation(ctx, items); err != nil {
-			return nil, errors.NewBadRequest(err.Error())
+			return nil, err
 		}
 	}
 
