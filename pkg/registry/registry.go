@@ -127,12 +127,8 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 	l.RUnlock()
 	if !ok {
 		obj := l.New()
-		obj, err := objInfo.UpdatedObject(ctx, obj)
-		if err != nil {
-			return nil, false, errors.NewInternalError(err)
-		}
 
-		obj, err = l.Create(ctx, obj, createValidation, nil)
+		obj, err := l.Create(ctx, obj, createValidation, nil)
 		if err != nil {
 			return nil, false, err
 		}
