@@ -45,13 +45,13 @@ type objcetKey struct {
 type leaseStorage struct {
 	sync.RWMutex
 	store   map[objcetKey]*coordinationv1.Lease
-	watches map[*watch.FakeWatcher]struct{}
+	watches map[*leaseStorageWatch]struct{}
 }
 
 func NewMemoryStore() rest.Storage {
 	return &leaseStorage{
 		store:   map[objcetKey]*coordinationv1.Lease{},
-		watches: map[*watch.FakeWatcher]struct{}{},
+		watches: map[*leaseStorageWatch]struct{}{},
 	}
 }
 
@@ -225,39 +225,46 @@ func (l *leaseStorage) Get(ctx context.Context, name string, options *metav1.Get
 }
 
 func (l *leaseStorage) notifyWatchers(eventType watch.EventType, obj runtime.Object) {
-	var deleted []*watch.FakeWatcher
 	l.RLock()
-	for watcher := range l.watches {
-		if watcher.IsStopped() {
-			deleted = append(deleted, watcher)
-		} else {
-			watcher.Action(eventType, obj)
-		}
+	watchers := make([]*leaseStorageWatch, 0, len(l.watches))
+	for w := range l.watches {
+		watchers = append(watchers, w)
 	}
 	l.RUnlock()
 
-	l.Lock()
-	for _, key := range deleted {
-		delete(l.watches, key)
+	for len(watchers) > 0 {
+		var pending []*leaseStorageWatch
+		for _, w := range watchers {
+			if w.IsStopped() {
+				continue
+			}
+			select {
+			case w.ch <- watch.Event{Type: eventType, Object: obj}:
+			default:
+				pending = append(pending, w)
+			}
+		}
+		watchers = pending
 	}
-	l.Unlock()
 }
 
 func (l *leaseStorage) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
-	ch := watch.NewFake()
+	w := &leaseStorageWatch{
+		f:  l,
+		ch: make(chan watch.Event, 1),
+	}
 
+	l.Lock()
+	l.watches[w] = struct{}{}
+	l.Unlock()
+
+	items := l.list(ctx, options)
 	go func() {
-		l.Lock()
-		l.watches[ch] = struct{}{}
-		l.Unlock()
-
-		items := l.list(ctx, options)
 		for _, item := range items.Items {
-			ch.Add(&item)
+			w.ch <- watch.Event{Type: watch.Added, Object: item.DeepCopy()}
 		}
 	}()
-
-	return ch, nil
+	return w, nil
 }
 
 func (*leaseStorage) NewList() runtime.Object {
