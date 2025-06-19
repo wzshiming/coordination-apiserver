@@ -195,20 +195,23 @@ func (l *leaseStorage) Delete(ctx context.Context, name string, deleteValidation
 
 func (l *leaseStorage) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
 	items := l.list(ctx, listOptions)
+	list := &coordinationv1.LeaseList{
+		Items: items,
+	}
 
 	if deleteValidation != nil {
-		if err := deleteValidation(ctx, items); err != nil {
+		if err := deleteValidation(ctx, list); err != nil {
 			return nil, err
 		}
 	}
 
 	l.Lock()
 	defer l.Unlock()
-	for _, key := range items.Items {
+	for _, key := range items {
 		key := objcetKey{Name: key.Name, Namespace: key.Namespace}
 		delete(l.store, key)
 	}
-	return items, nil
+	return list, nil
 }
 
 func (l *leaseStorage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
@@ -260,8 +263,8 @@ func (l *leaseStorage) Watch(ctx context.Context, options *metainternalversion.L
 
 	items := l.list(ctx, options)
 	go func() {
-		for _, item := range items.Items {
-			w.ch <- watch.Event{Type: watch.Added, Object: item.DeepCopy()}
+		for _, item := range items {
+			w.ch <- watch.Event{Type: watch.Added, Object: &item}
 		}
 	}()
 	return w, nil
@@ -274,21 +277,27 @@ func (*leaseStorage) NewList() runtime.Object {
 func (l *leaseStorage) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
 	items := l.list(ctx, options)
 
-	sort.Slice(items.Items, func(i, j int) bool {
-		if items.Items[i].Namespace != items.Items[j].Namespace {
-			return items.Items[i].Namespace < items.Items[j].Namespace
-		}
-		return items.Items[i].Name < items.Items[j].Name
-	})
-	return items, nil
+	softLeases(items)
+	return &coordinationv1.LeaseList{
+		Items: items,
+	}, nil
 }
 
-func (l *leaseStorage) list(ctx context.Context, options *metainternalversion.ListOptions) *coordinationv1.LeaseList {
+func softLeases(items []coordinationv1.Lease) {
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Namespace != items[j].Namespace {
+			return items[i].Namespace < items[j].Namespace
+		}
+		return items[i].Name < items[j].Name
+	})
+}
+
+func (l *leaseStorage) list(ctx context.Context, options *metainternalversion.ListOptions) []coordinationv1.Lease {
 	namespace := genericapirequest.NamespaceValue(ctx)
 
 	l.RLock()
 	defer l.RUnlock()
-	var items coordinationv1.LeaseList
+	items := make([]coordinationv1.Lease, 0, len(l.store))
 	for key, obj := range l.store {
 		if namespace != "" && key.Namespace != namespace {
 			continue
@@ -296,11 +305,10 @@ func (l *leaseStorage) list(ctx context.Context, options *metainternalversion.Li
 		if options.LabelSelector != nil && !options.LabelSelector.Matches(labels.Set(obj.Labels)) {
 			continue
 		}
-
-		items.Items = append(items.Items, *obj)
+		items = append(items, *obj)
 	}
 
-	return &items
+	return items
 }
 
 func (*leaseStorage) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
