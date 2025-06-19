@@ -18,7 +18,6 @@ package registry
 
 import (
 	"context"
-	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -28,9 +27,11 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	durationutil "k8s.io/apimachinery/pkg/util/duration"
+	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
@@ -43,9 +44,11 @@ type objcetKey struct {
 }
 
 type leaseStorage struct {
-	sync.RWMutex
-	store   map[objcetKey]*coordinationv1.Lease
-	watches map[*leaseStorageWatch]struct{}
+	storeMut sync.RWMutex
+	store    map[objcetKey]*coordinationv1.Lease
+
+	watchesMut sync.RWMutex
+	watches    map[*leaseStorageWatch]struct{}
 }
 
 func NewMemoryStore() rest.Storage {
@@ -56,6 +59,8 @@ func NewMemoryStore() rest.Storage {
 }
 
 var _ interface {
+	rest.Scoper
+	rest.KindProvider
 	rest.SingularNameProvider
 	rest.StandardStorage
 } = (*leaseStorage)(nil)
@@ -84,10 +89,16 @@ func (l *leaseStorage) Create(ctx context.Context, obj runtime.Object, createVal
 		return nil, errors.NewInternalError(err)
 	}
 
-	rest.FillObjectMetaSystemFields(objectMeta)
-	name := objectMeta.GetName()
-	namespace := objectMeta.GetNamespace()
+	if objectMeta.GetCreationTimestamp().UTC().IsZero() {
+		objectMeta.SetCreationTimestamp(metav1.Now())
+	}
 
+	if objectMeta.GetUID() == "" {
+		objectMeta.SetUID(uuid.NewUUID())
+	}
+
+	name := objectMeta.GetName()
+	namespace := genericapirequest.NamespaceValue(ctx)
 	if name == "" {
 		generateName := objectMeta.GetGenerateName()
 		if generateName != "" {
@@ -96,12 +107,9 @@ func (l *leaseStorage) Create(ctx context.Context, obj runtime.Object, createVal
 		}
 	}
 
-	key := objcetKey{Name: name, Namespace: namespace}
-	l.RLock()
-	_, ok := l.store[key]
-	l.RUnlock()
+	_, ok := l.get(namespace, name)
 	if ok {
-		return nil, errors.NewAlreadyExists(coordinationv1.Resource("leases"), fmt.Sprintf("%s/%s", namespace, name))
+		return nil, errors.NewAlreadyExists(coordinationv1.Resource("leases"), name)
 	}
 
 	if createValidation != nil {
@@ -110,24 +118,28 @@ func (l *leaseStorage) Create(ctx context.Context, obj runtime.Object, createVal
 		}
 	}
 
-	l.Lock()
-	l.store[key] = obj.(*coordinationv1.Lease)
-	l.Unlock()
+	lease := obj.(*coordinationv1.Lease)
 
-	l.notifyWatchers(watch.Added, obj)
+	l.put(namespace, name, lease)
+
+	l.notifyWatchers(watch.Added, lease)
 	return obj, nil
+}
+
+func (l *leaseStorage) put(namespace, name string, lease *coordinationv1.Lease) {
+	key := objcetKey{Name: name, Namespace: namespace}
+
+	l.storeMut.Lock()
+	defer l.storeMut.Unlock()
+	l.store[key] = lease
 }
 
 func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
 	namespace := genericapirequest.NamespaceValue(ctx)
-	key := objcetKey{Name: name, Namespace: namespace}
-
-	l.RLock()
-	obj, ok := l.store[key]
-	l.RUnlock()
+	obj, ok := l.get(namespace, name)
 	if !ok {
 		if !forceAllowCreate {
-			return nil, false, errors.NewNotFound(coordinationv1.Resource("leases"), fmt.Sprintf("%s/%s", namespace, name))
+			return nil, false, errors.NewNotFound(coordinationv1.Resource("leases"), name)
 		}
 
 		updated, err := objInfo.UpdatedObject(ctx, obj)
@@ -141,11 +153,10 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 			}
 		}
 
-		l.Lock()
-		l.store[key] = updated.(*coordinationv1.Lease)
-		l.Unlock()
+		lease := updated.(*coordinationv1.Lease)
+		l.put(namespace, name, lease)
 
-		l.notifyWatchers(watch.Added, updated)
+		l.notifyWatchers(watch.Added, lease)
 		return updated, true, nil
 	}
 
@@ -160,23 +171,19 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 		}
 	}
 
-	l.Lock()
-	l.store[key] = updated.(*coordinationv1.Lease)
-	l.Unlock()
+	lease := updated.(*coordinationv1.Lease)
 
-	l.notifyWatchers(watch.Modified, updated)
+	l.put(namespace, name, lease)
+
+	l.notifyWatchers(watch.Modified, lease)
 	return updated, false, nil
 }
 
 func (l *leaseStorage) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
 	namespace := genericapirequest.NamespaceValue(ctx)
-	key := objcetKey{Name: name, Namespace: namespace}
-
-	l.RLock()
-	obj, ok := l.store[key]
-	l.RUnlock()
+	obj, ok := l.get(namespace, name)
 	if !ok {
-		return nil, false, errors.NewNotFound(coordinationv1.Resource("leases"), fmt.Sprintf("%s/%s", namespace, name))
+		return nil, false, errors.NewNotFound(coordinationv1.Resource("leases"), name)
 	}
 
 	if deleteValidation != nil {
@@ -185,16 +192,23 @@ func (l *leaseStorage) Delete(ctx context.Context, name string, deleteValidation
 		}
 	}
 
-	l.Lock()
-	delete(l.store, key)
-	l.Unlock()
+	l.del(namespace, name)
 
 	l.notifyWatchers(watch.Deleted, obj)
 	return obj, true, nil
 }
 
+func (l *leaseStorage) del(namespace, name string) {
+	key := objcetKey{Name: name, Namespace: namespace}
+
+	l.storeMut.Lock()
+	defer l.storeMut.Unlock()
+	delete(l.store, key)
+}
+
 func (l *leaseStorage) DeleteCollection(ctx context.Context, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions, listOptions *metainternalversion.ListOptions) (runtime.Object, error) {
-	items := l.list(ctx, listOptions)
+	namespace := genericapirequest.NamespaceValue(ctx)
+	items := l.list(namespace, listOptions)
 	list := &coordinationv1.LeaseList{
 		Items: items,
 	}
@@ -205,37 +219,43 @@ func (l *leaseStorage) DeleteCollection(ctx context.Context, deleteValidation re
 		}
 	}
 
-	l.Lock()
-	defer l.Unlock()
 	for _, key := range items {
-		key := objcetKey{Name: key.Name, Namespace: key.Namespace}
-		delete(l.store, key)
+		l.del(key.Name, key.Namespace)
+
+		l.notifyWatchers(watch.Deleted, &key)
 	}
 	return list, nil
 }
 
 func (l *leaseStorage) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
 	namespace := genericapirequest.NamespaceValue(ctx)
-	key := objcetKey{Name: name, Namespace: namespace}
-
-	l.RLock()
-	obj, ok := l.store[key]
-	l.RUnlock()
+	obj, ok := l.get(namespace, name)
 	if !ok {
-		return nil, errors.NewNotFound(coordinationv1.Resource("leases"), fmt.Sprintf("%s/%s", namespace, name))
+		return nil, errors.NewNotFound(coordinationv1.Resource("leases"), name)
 	}
 	return obj, nil
 }
 
-func (l *leaseStorage) notifyWatchers(eventType watch.EventType, obj runtime.Object) {
-	l.RLock()
+func (l *leaseStorage) get(namespace, name string) (*coordinationv1.Lease, bool) {
+	key := objcetKey{Name: name, Namespace: namespace}
+
+	l.storeMut.RLock()
+	defer l.storeMut.RUnlock()
+	obj, ok := l.store[key]
+	return obj, ok
+}
+
+func (l *leaseStorage) notifyWatchers(eventType watch.EventType, obj *coordinationv1.Lease) {
+	l.watchesMut.RLock()
 	watchers := make([]*leaseStorageWatch, 0, len(l.watches))
 	for w := range l.watches {
-		watchers = append(watchers, w)
+		if l.filter(obj, w.namespace, w.options) {
+			watchers = append(watchers, w)
+		}
 	}
-	l.RUnlock()
+	l.watchesMut.RUnlock()
 
-	for len(watchers) > 0 {
+	for i := 0; i != 10 && len(watchers) > 0; i++ {
 		var pending []*leaseStorageWatch
 		for _, w := range watchers {
 			if w.IsStopped() {
@@ -252,16 +272,18 @@ func (l *leaseStorage) notifyWatchers(eventType watch.EventType, obj runtime.Obj
 }
 
 func (l *leaseStorage) Watch(ctx context.Context, options *metainternalversion.ListOptions) (watch.Interface, error) {
+	namespace := genericapirequest.NamespaceValue(ctx)
+
 	w := &leaseStorageWatch{
 		f:  l,
-		ch: make(chan watch.Event, 1),
+		ch: make(chan watch.Event, 100),
 	}
 
-	l.Lock()
+	l.watchesMut.Lock()
 	l.watches[w] = struct{}{}
-	l.Unlock()
+	l.watchesMut.Unlock()
 
-	items := l.list(ctx, options)
+	items := l.list(namespace, options)
 	go func() {
 		for _, item := range items {
 			w.ch <- watch.Event{Type: watch.Added, Object: &item}
@@ -275,7 +297,8 @@ func (*leaseStorage) NewList() runtime.Object {
 }
 
 func (l *leaseStorage) List(ctx context.Context, options *metainternalversion.ListOptions) (runtime.Object, error) {
-	items := l.list(ctx, options)
+	namespace := genericapirequest.NamespaceValue(ctx)
+	items := l.list(namespace, options)
 
 	softLeases(items)
 	return &coordinationv1.LeaseList{
@@ -292,23 +315,42 @@ func softLeases(items []coordinationv1.Lease) {
 	})
 }
 
-func (l *leaseStorage) list(ctx context.Context, options *metainternalversion.ListOptions) []coordinationv1.Lease {
-	namespace := genericapirequest.NamespaceValue(ctx)
-
-	l.RLock()
-	defer l.RUnlock()
+func (l *leaseStorage) list(namespace string, options *metainternalversion.ListOptions) []coordinationv1.Lease {
+	l.storeMut.RLock()
+	defer l.storeMut.RUnlock()
 	items := make([]coordinationv1.Lease, 0, len(l.store))
-	for key, obj := range l.store {
-		if namespace != "" && key.Namespace != namespace {
-			continue
+	for _, obj := range l.store {
+		if l.filter(obj, namespace, options) {
+			items = append(items, *obj)
 		}
-		if options.LabelSelector != nil && !options.LabelSelector.Matches(labels.Set(obj.Labels)) {
-			continue
+	}
+	return items
+}
+
+func (l *leaseStorage) filter(obj *coordinationv1.Lease, namespace string, options *metainternalversion.ListOptions) bool {
+	if namespace != "" {
+		if obj.Namespace != namespace {
+			return false
 		}
-		items = append(items, *obj)
 	}
 
-	return items
+	if options != nil {
+		if labelSelector := options.LabelSelector; labelSelector != nil {
+			if !labelSelector.Matches(labels.Set(obj.Labels)) {
+				return false
+			}
+		}
+		if fieldSelector := options.FieldSelector; fieldSelector != nil {
+			if !fieldSelector.Matches(fields.Set{
+				"metadata.name":      obj.Name,
+				"metadata.namespace": obj.Namespace,
+			}) {
+				return false
+			}
+		}
+	}
+
+	return true
 }
 
 func (*leaseStorage) ConvertToTable(ctx context.Context, object runtime.Object, tableOptions runtime.Object) (*metav1.Table, error) {
