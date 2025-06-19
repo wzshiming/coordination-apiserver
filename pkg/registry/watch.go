@@ -15,9 +15,9 @@ type leaseStorageWatch struct {
 func (w *leaseStorageWatch) Stop() {
 	w.stopped.Store(true)
 
-	w.f.Lock()
+	w.f.watchesMut.Lock()
 	delete(w.f.watches, w)
-	w.f.Unlock()
+	w.f.watchesMut.Unlock()
 }
 
 func (w *leaseStorageWatch) IsStopped() bool {
