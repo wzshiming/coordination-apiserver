@@ -18,6 +18,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -36,6 +37,10 @@ import (
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
+)
+
+var (
+	errUIDMismatch = fmt.Errorf("UID mismatch")
 )
 
 type objcetKey struct {
@@ -165,13 +170,16 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 		return nil, false, err
 	}
 
+	lease := updated.(*coordinationv1.Lease)
+	if newUID := lease.GetUID(); newUID != "" && newUID != obj.GetUID() {
+		return nil, false, errors.NewConflict(coordinationv1.Resource("leases"), name, errUIDMismatch)
+	}
+
 	if updateValidation != nil {
 		if err = updateValidation(ctx, updated, obj); err != nil {
 			return nil, false, err
 		}
 	}
-
-	lease := updated.(*coordinationv1.Lease)
 
 	l.put(namespace, name, lease)
 
