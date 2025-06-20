@@ -22,6 +22,7 @@ import (
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 )
@@ -183,5 +184,133 @@ func TestWatch(t *testing.T) {
 				t.Errorf("Expected event %d to be %v, got %v", i, eventType, receivedEvents[i])
 			}
 		}
+	}
+}
+
+func TestResourceVersion(t *testing.T) {
+	leaseClient := clientset.CoordinationV1().Leases("default")
+
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-rv-lease",
+			Namespace: "default",
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       pointer("test-rv-holder"),
+			LeaseDurationSeconds: pointer(int32(30)),
+		},
+	}
+
+	// Create lease
+	createdLease, err := leaseClient.Create(context.TODO(), lease, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create lease: %v", err)
+	}
+	createdRV := createdLease.GetResourceVersion()
+
+	// Get lease and verify RV matches
+	getLease, err := leaseClient.Get(context.TODO(), lease.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Failed to get lease: %v", err)
+	}
+	if getLease.GetResourceVersion() != createdRV {
+		t.Errorf("Expected resource version %s, got %s", createdRV, getLease.GetResourceVersion())
+	}
+
+	// Update lease and verify RV increments
+	updatedLease := lease.DeepCopy()
+	*updatedLease.Spec.HolderIdentity = "updated-rv-holder"
+	updatedLease, err = leaseClient.Update(context.TODO(), updatedLease, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to update lease: %v", err)
+	}
+	if updatedLease.GetResourceVersion() == createdRV {
+		t.Error("Expected resource version to change after update")
+	}
+
+	// Try to update with old resource version should fail
+	_, err = leaseClient.Update(context.TODO(), getLease, metav1.UpdateOptions{})
+	if err == nil {
+		t.Error("Expected conflict error when updating with stale resource version")
+	} else if !errors.IsConflict(err) {
+		t.Errorf("Expected conflict error, got %v", err)
+	}
+
+	// List leases and verify RV
+	list, err := leaseClient.List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("Failed to list leases: %v", err)
+	}
+	if list.GetResourceVersion() == "" {
+		t.Error("Expected non-empty resource version in list response")
+	}
+}
+
+func TestListWatchWithResourceVersion(t *testing.T) {
+	leaseClient := clientset.CoordinationV1().Leases("default")
+
+	// Create initial lease
+	lease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-list-watch",
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       pointer("initial-holder"),
+			LeaseDurationSeconds: pointer(int32(30)),
+		},
+	}
+
+	createdLease, err := leaseClient.Create(context.TODO(), lease, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create lease: %v", err)
+	}
+	initialRV := createdLease.GetResourceVersion()
+
+	// Start watch from initial RV
+	watcher, err := leaseClient.Watch(context.TODO(), metav1.ListOptions{
+		ResourceVersion: initialRV,
+	})
+	if err != nil {
+		t.Fatalf("Failed to watch leases: %v", err)
+	}
+	defer watcher.Stop()
+
+	// Create another lease that should be picked up by watch
+	newLease := &coordinationv1.Lease{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-list-watch-2",
+		},
+		Spec: coordinationv1.LeaseSpec{
+			HolderIdentity:       pointer("new-holder"),
+			LeaseDurationSeconds: pointer(int32(30)),
+		},
+	}
+	_, err = leaseClient.Create(context.TODO(), newLease, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("Failed to create second lease: %v", err)
+	}
+
+	// Verify we get the ADDED event for new lease
+	select {
+	case event := <-watcher.ResultChan():
+		if event.Type != watch.Added {
+			t.Errorf("Expected ADDED event, got %v", event.Type)
+		}
+		if event.Object.(*coordinationv1.Lease).Name != newLease.Name {
+			t.Errorf("Expected lease %s, got %s", newLease.Name, event.Object.(*coordinationv1.Lease).Name)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("Timed out waiting for watch event")
+	}
+
+	// List with resourceVersion should return current state
+	list, err := leaseClient.List(context.TODO(), metav1.ListOptions{
+		ResourceVersion: initialRV,
+	})
+	if err != nil {
+		t.Fatalf("Failed to list leases: %v", err)
+	}
+	if len(list.Items) < 1 {
+		t.Errorf("Expected at least 1 leases, got %d", len(list.Items))
 	}
 }

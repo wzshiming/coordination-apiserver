@@ -20,7 +20,9 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	coordinationv1 "k8s.io/api/coordination/v1"
@@ -40,7 +42,8 @@ import (
 )
 
 var (
-	errUIDMismatch = fmt.Errorf("UID mismatch")
+	errUIDMismatch             = fmt.Errorf("UID mismatch")
+	errResourceVersionMismatch = fmt.Errorf("ResourceVersion mismatch")
 )
 
 type objcetKey struct {
@@ -54,6 +57,8 @@ type leaseStorage struct {
 
 	watchesMut sync.RWMutex
 	watches    map[*leaseStorageWatch]struct{}
+
+	resourceVersion uint64
 }
 
 func NewMemoryStore() rest.Storage {
@@ -87,6 +92,14 @@ func (*leaseStorage) New() runtime.Object {
 }
 
 func (*leaseStorage) Destroy() {}
+
+func (l *leaseStorage) nextResourceVersion() string {
+	return strconv.FormatUint(atomic.AddUint64(&l.resourceVersion, 1), 10)
+}
+
+func (l *leaseStorage) currentResourceVersion() string {
+	return strconv.FormatUint(atomic.LoadUint64(&l.resourceVersion), 10)
+}
 
 func (l *leaseStorage) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
 	objectMeta, err := meta.Accessor(obj)
@@ -124,10 +137,10 @@ func (l *leaseStorage) Create(ctx context.Context, obj runtime.Object, createVal
 	}
 
 	lease := obj.(*coordinationv1.Lease)
-
+	lease.ResourceVersion = l.nextResourceVersion()
 	l.put(namespace, name, lease)
-
 	l.notifyWatchers(watch.Added, lease)
+
 	return obj, nil
 }
 
@@ -159,9 +172,10 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 		}
 
 		lease := updated.(*coordinationv1.Lease)
+		lease.ResourceVersion = l.nextResourceVersion()
 		l.put(namespace, name, lease)
-
 		l.notifyWatchers(watch.Added, lease)
+
 		return updated, true, nil
 	}
 
@@ -171,8 +185,12 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 	}
 
 	lease := updated.(*coordinationv1.Lease)
-	if newUID := lease.GetUID(); newUID != "" && newUID != obj.GetUID() {
+	if newUID, oldUID := lease.GetUID(), obj.GetUID(); newUID != "" && oldUID != "" && newUID != oldUID {
 		return nil, false, errors.NewConflict(coordinationv1.Resource("leases"), name, errUIDMismatch)
+	}
+
+	if lease.ResourceVersion != "" && lease.ResourceVersion != obj.GetResourceVersion() {
+		return nil, false, errors.NewConflict(coordinationv1.Resource("leases"), name, errResourceVersionMismatch)
 	}
 
 	if updateValidation != nil {
@@ -181,9 +199,10 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 		}
 	}
 
+	lease.ResourceVersion = l.nextResourceVersion()
 	l.put(namespace, name, lease)
-
 	l.notifyWatchers(watch.Modified, lease)
+
 	return updated, false, nil
 }
 
@@ -200,9 +219,10 @@ func (l *leaseStorage) Delete(ctx context.Context, name string, deleteValidation
 		}
 	}
 
+	obj.ResourceVersion = l.nextResourceVersion()
 	l.del(namespace, name)
-
 	l.notifyWatchers(watch.Deleted, obj)
+
 	return obj, true, nil
 }
 
@@ -227,11 +247,13 @@ func (l *leaseStorage) DeleteCollection(ctx context.Context, deleteValidation re
 		}
 	}
 
+	list.ResourceVersion = l.nextResourceVersion()
 	for _, key := range items {
+		key.ResourceVersion = list.ResourceVersion
 		l.del(key.Name, key.Namespace)
-
 		l.notifyWatchers(watch.Deleted, &key)
 	}
+
 	return list, nil
 }
 
@@ -294,11 +316,14 @@ func (l *leaseStorage) Watch(ctx context.Context, options *metainternalversion.L
 	l.watchesMut.Unlock()
 
 	items := l.list(namespace, options)
-	go func() {
-		for _, item := range items {
-			w.ch <- watch.Event{Type: watch.Added, Object: &item}
-		}
-	}()
+
+	if len(items) != 0 {
+		go func() {
+			for _, item := range items {
+				w.ch <- watch.Event{Type: watch.Added, Object: &item}
+			}
+		}()
+	}
 	return w, nil
 }
 
@@ -311,9 +336,11 @@ func (l *leaseStorage) List(ctx context.Context, options *metainternalversion.Li
 	items := l.list(namespace, options)
 
 	softLeases(items)
-	return &coordinationv1.LeaseList{
+	list := &coordinationv1.LeaseList{
 		Items: items,
-	}, nil
+	}
+	list.ResourceVersion = l.currentResourceVersion()
+	return list, nil
 }
 
 func softLeases(items []coordinationv1.Lease) {
@@ -355,6 +382,19 @@ func (l *leaseStorage) filter(obj *coordinationv1.Lease, namespace string, optio
 				"metadata.name":      obj.Name,
 				"metadata.namespace": obj.Namespace,
 			}) {
+				return false
+			}
+		}
+		if rv := options.ResourceVersion; rv != "" && rv != "0" {
+			objRV, err := strconv.ParseUint(obj.ResourceVersion, 10, 64)
+			if err != nil {
+				return false
+			}
+			reqRV, err := strconv.ParseUint(rv, 10, 64)
+			if err != nil {
+				return false
+			}
+			if objRV <= reqRV {
 				return false
 			}
 		}
