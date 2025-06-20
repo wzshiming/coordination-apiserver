@@ -18,6 +18,7 @@ package registry
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"sync"
 	"time"
@@ -165,19 +166,24 @@ func (l *leaseStorage) Update(ctx context.Context, name string, objInfo rest.Upd
 		return nil, false, err
 	}
 
+	lease := updated.(*coordinationv1.Lease)
+	if lease.GetUID() != obj.GetUID() {
+		return nil, false, errors.NewConflict(coordinationv1.Resource("leases"), name, errUIDMismatch)
+	}
+
 	if updateValidation != nil {
 		if err = updateValidation(ctx, updated, obj); err != nil {
 			return nil, false, err
 		}
 	}
 
-	lease := updated.(*coordinationv1.Lease)
-
 	l.put(namespace, name, lease)
 
 	l.notifyWatchers(watch.Modified, lease)
 	return updated, false, nil
 }
+
+var errUIDMismatch = fmt.Errorf("UID mismatch")
 
 func (l *leaseStorage) Delete(ctx context.Context, name string, deleteValidation rest.ValidateObjectFunc, options *metav1.DeleteOptions) (runtime.Object, bool, error) {
 	namespace := genericapirequest.NamespaceValue(ctx)
